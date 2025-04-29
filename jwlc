@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
-from pprint import pprint
+from copy import deepcopy
 from string import ascii_letters as ASCII_ALPHA, digits as ASCII_DIGIT
 from typing import Any, Literal, TypedDict, Callable, List
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from subprocess import run
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 class Dictionary(TypedDict):
 	__getattr__ = dict.get
@@ -207,17 +207,18 @@ class Types:
 		def __str__(self):
 			return 'u64, i64, or ptr'
 
-	u8  = Integer('u8',  1)
-	u16 = Integer('u16', 2)
-	u32 = Integer('u32', 4)
-	u64 = Integer('u64', 8)
-	i8  = Integer('i8',  1)
-	i16 = Integer('i16', 2)
-	i32 = Integer('i32', 4)
-	i64 = Integer('i64', 8)
-	ptr: Callable[[Type | None], Pointer] = lambda v: Types.Pointer('ptr', 8, v)
+	builtin = {
+		'u8' : Integer('u8',  1),
+		'u16': Integer('u16', 2),
+		'u32': Integer('u32', 4),
+		'u64': Integer('u64', 8),
+		'i8' : Integer('i8',  1),
+		'i16': Integer('i16', 2),
+		'i32': Integer('i32', 4),
+		'i64': Integer('i64', 8),
+		'ptr': lambda v: Types.Pointer('ptr', 8, v),
+	}
 	cmd: Callable[[list[Type], Type | None], Command] = lambda inp, out: Types.Command('cmd', 8, inp, out)
-
 	iop = IntegerOrPointer('iop', 8)
 
 class IR:
@@ -249,6 +250,12 @@ class IR:
 	@dataclass
 	class PushString(Code):
 		value: str
+	@dataclass
+	class CopyLocal(Code):
+		name: str
+	@dataclass
+	class CopyArguments(Code):
+		args: list[tuple[str, Types.Type]]
 
 @dataclass
 class Parser:
@@ -256,6 +263,12 @@ class Parser:
 	modules: list['Parser.Module'] = None
 	ir: list[IR.Code] = None
 
+	@dataclass
+	class TypeSpecifier:
+		where: Where
+		name: str
+		template: list['Parser.TypeSpecifier'] = field(default_factory=lambda: [])
+		type: Types.Type = None
 	@dataclass
 	class IntegerExpression:
 		where: Where
@@ -271,6 +284,8 @@ class Parser:
 		where: Where
 		value: str
 		type: Types.Type = None
+		cmdid: int = None
+		gblid: int = None
 	@dataclass
 	class BuiltinExpression:
 		BUILTINS = Literal['JWLBUILTIN_SYSCALL3']
@@ -285,22 +300,36 @@ class Parser:
 		rhs: list['Parser.PrimaryExpression']
 	Expression = CommandExpression | PrimaryExpression
 	Statement = Expression
-	IndentedBlock = list[Statement]
+	@dataclass
+	class CommandDefinition:
+		where: Where
+		name: str
+		index: int
+		input: dict[str, 'Parser.TypeSpecifier'] = field(default_factory=lambda: {})
+		output: 'Parser.TypeSpecifier | None' = None
+		template: list[str] = field(default_factory=lambda: [])
+		body: 'Parser.IndentedBlock' = field(default_factory=lambda: [])
+		type: Types.Type = None
+	Definition = CommandDefinition
+	IndentedBlock = list[Statement | Definition]
 	@dataclass
 	class Module:
 		path: str
 		index: int
 		beg: 'Parser.IndentedBlock'
 		end: 'Parser.IndentedBlock'
+		cmd: 'list[Parser.CommandDefinition]'
 
 	def __post_init__(self):
 		modules: list[Parser.Module] = []
 		ir: list[IR.Code] = []
+		cmdid = 0
 
 		def parse_module(path: Path):
 			tokens = Tokens(path)
 			beg: Parser.IndentedBlock = []
 			end: Parser.IndentedBlock = []
+			cmd: list[Parser.CommandDefinition] = []
 
 			while tokens.value() == 'import':
 				raise NotImplementedError
@@ -314,12 +343,16 @@ class Parser:
 				end = parse_indented_block(tokens, 0)
 
 			while tokens.value():
-				raise NotImplementedError
+				definition = parse_definition(tokens, 0)
+				if type(definition) is Parser.CommandDefinition:
+					cmd.append(definition)
+				else:
+					raise NotImplementedError
 
-			modules.append(Parser.Module(path, len(modules), beg, end))
+			modules.append(Parser.Module(path, len(modules), beg, end, cmd))
 
 		def parse_indented_block(tokens: Tokens, level: int) -> Parser.IndentedBlock:
-			statements = Parser.IndentedBlock()
+			nodes = Parser.IndentedBlock()
 			
 			if tokens.type() is Tokens.Indent:
 				if len(tokens.value()) <= level:
@@ -328,9 +361,42 @@ class Parser:
 
 				while tokens.type() is Tokens.Indent and len(tokens.value()) == level:
 					tokens.expect(Tokens.Indent)
-					statements.append(parse_statement(tokens, level))
+					try:
+						nodes.append(parse_definition(tokens, level))
+					except Error:
+						nodes.append(parse_statement(tokens, level))
 
-			return statements
+			return nodes
+		
+		def parse_definition(tokens: Tokens, level: int) -> Parser.Definition:
+			return parse_command_definition(tokens, level)
+		
+		def parse_command_definition(tokens: Tokens, level: int) -> Parser.CommandDefinition:
+			nonlocal cmdid
+			command = Parser.CommandDefinition(tokens.expect('cmd').where, tokens.expect(Tokens.Name).value, cmdid)
+
+			while tokens.type() is Tokens.Name:
+				name = tokens.expect(Tokens.Name)
+				if name.value in command.input:
+					name.error('each command parameter must be uniquely named')
+				command.input[name.value] = None
+
+			if len(command.input) or tokens.value() == '[':
+				tokens.expect('[')
+				tokens.expect(']')
+
+			for name in command.input:
+				command.input[name] = parse_type_specifier(tokens)
+
+			if tokens.type() is not Tokens.Newline:
+				tokens.expect('-', '>')
+				command.output = parse_type_specifier(tokens)
+
+			tokens.expect(Tokens.Newline)
+			command.body = parse_indented_block(tokens, level)
+
+			cmdid += 1
+			return command
 
 		def parse_statement(tokens: Tokens, level: int) -> Parser.Statement:
 			return tokens.follow(parse_expression(tokens), Tokens.Newline)
@@ -364,36 +430,94 @@ class Parser:
 			else:
 				tokens.error('expected expression')
 
-		def typecheck(node: Parser.Module | Parser.Statement):
+		def parse_type_specifier(tokens: Tokens) -> Parser.TypeSpecifier:
+			spec = Parser.TypeSpecifier(tokens.where(), tokens.expect(Tokens.Name).value)
+			if tokens.value() == '[':
+				tokens.expect('[')
+				while True:
+					spec.template.append(parse_type_specifier(tokens))
+					if tokens.type() != Tokens.Name:
+						break
+				tokens.expect(']')
+			return spec
+		
+		cmds: dict[str, list[Parser.CommandDefinition]] = {}
+		vars: dict[str, Types] = {}
+
+		def typecheck(node: Parser.Module | Parser.Definition | Parser.Statement):
+			nonlocal cmds, vars
 			match type(node):
 				case Parser.Module:
+					[typecheck(command) for command in node.cmd]
 					[typecheck(statement) for statement in node.beg]
 					[typecheck(statement) for statement in node.end]
+					[typecheck(command) for command in node.cmd]
+				case Parser.CommandDefinition:
+					if node.type is None:
+						[typecheck(node.input[name]) for name in node.input]
+						typecheck(node.output) if node.output is not None else ...
+						node.type = Types.cmd([node.input[name].type for name in node.input], node.output.type if node.output else None)
+						if node.name not in cmds:
+							cmds[node.name] = []
+						for cmd in cmds[node.name]:
+							if cmd.input == node.type.input:
+								node.where.error(f'cannot overload command `{node.name}`, as it has the same name and signature as another commmand')
+						cmds[node.name].append(node)
+					else:
+						tcmds = deepcopy(cmds)
+						tvars = deepcopy(vars)
+						vars = {}
+						[vars.update({parameter: node.input[parameter].type}) for parameter in node.input]
+						[typecheck(content) for content in node.body]
+						cmds = tcmds
+						vars = tvars
 				case Parser.CommandExpression:
 					[typecheck(expression) for expression in node.rhs]
 					typecheck(node.lhs)
 					if type(node.lhs.type) is not Types.Command:
 						node.where.error(f'invalid left-hand side type for command expression: expected type `cmd` but found `{node.lhs.type}`')
 					elif len(node.rhs) != len(node.lhs.type.input):
-						node.where.error('argument-parameter count mismatch')
+						node.where.error('parameter-argument count mismatch')
 					for i in range(0, len(node.rhs)):
 						if (node.lhs.type.input[i] != node.rhs[i].type):
-							node.rhs[i].where.error(f'argument-parameter type mismatch: expected type `{node.lhs.type.input[i]}` but found `{node.rhs[i].type}`')
+							node.rhs[i].where.error(f'parameter-argument type mismatch: expected type `{node.lhs.type.input[i]}` but found `{node.rhs[i].type}`')
 					node.type = node.lhs.type.output
+				case Parser.NameExpression:
+					if node.value in cmds:
+						if len(cmds[node.value]) > 1:
+							raise NotImplementedError
+						else:
+							node.type = cmds[node.value][0].type
+							node.cmdid = cmds[node.value][0].index
+					elif node.value in vars:
+						node.type = vars[node.value]
+					else:
+						raise NotImplementedError
 				case Parser.IntegerExpression:
-					node.type = Types.i64
+					node.type = Types.builtin['i64']
 				case Parser.StringExpression:
-					node.type = Types.ptr(Types.u8)
+					node.type = Types.builtin['ptr'](Types.builtin['u8'])
 				case Parser.BuiltinExpression:
 					match node.value:
 						case node.value if node.value.startswith('JWLBUILTIN_SYSCALL'):
-							node.type = Types.cmd([Types.i64] + [Types.iop] * int(node.value[18:]), Types.i64)
+							node.type = Types.cmd([Types.builtin['i64']] + [Types.iop] * int(node.value[18:]), Types.builtin['i64'])
 						case _:
 							raise NotImplementedError(f'typecheck({node.value})')
+				case Parser.TypeSpecifier:
+					[typecheck(argument) for argument in node.template]
+					if node.name in Types.builtin:
+						if node.name == 'ptr':
+							if len(node.template) > 1:
+								node.where.error(f'too many template arguments for pointer type')
+							node.type = Types.builtin['ptr'](node.template[0].type if len(node.template) else None)
+						else:
+							node.type = Types.builtin[node.name]
+					else:
+						raise NotImplementedError(f'typecheck({repr(node)})')
 				case _:
-					raise NotImplementedError(f'typecheck({type(node)})')
+					raise NotImplementedError(f'typecheck({repr(node)})')
 
-		def genir(node: Parser.Module | Parser.Statement):
+		def genir(node: Parser.Module | Parser.Definition | Parser.Statement):
 			match type(node):
 				case Parser.Module:
 					if len(node.beg):
@@ -405,11 +529,23 @@ class Parser:
 						ir.append(IR.FunctionEnter(node.end[0].where, f'mod{node.index}end'))
 						[genir(statement) for statement in node.end]
 						ir.append(IR.FunctionLeave(node.end[-1].where, f'mod{node.index}end'))
+				case Parser.CommandDefinition:
+					ir.append(IR.FunctionEnter(node.where, f'fun{node.index}'))
+					ir.append(IR.CopyArguments(node.where, [(arg, node.input[arg].type) for arg in node.input]))
+					[genir(content) for content in node.body]
+					ir.append(IR.FunctionLeave(node.where, f'fun{node.index}'))
 				case Parser.CommandExpression:
 					[genir(rhs) for rhs in node.rhs]
 					genir(node.lhs)
-					if type(node.lhs) is not Parser.BuiltinExpression:
+					if type(node.lhs) not in [Parser.BuiltinExpression, Parser.NameExpression]:
 						raise NotImplementedError
+				case Parser.NameExpression:
+					if node.cmdid is not None:
+						ir.append(IR.FunctionCall(node.where, f'fun{node.cmdid}', len(node.type.input)))
+					elif node.gblid is not None:
+						raise NotImplementedError(f'genir({node})')
+					else:
+						ir.append(IR.CopyLocal(node.where, node.value))
 				case Parser.IntegerExpression:
 					ir.append(IR.PushInteger(node.where, node.value))
 				case Parser.StringExpression:
@@ -419,9 +555,10 @@ class Parser:
 						case node.value if node.value.startswith('JWLBUILTIN_SYSCALL'):
 							ir.append(IR.Syscall(node.where, int(node.value[18:])))
 						case _:
-							raise NotImplementedError(f'genir({node.value})')
+							raise NotImplementedError(f'genir({node})')
 				case _:
-					raise NotImplementedError(f'genir({type(node)})')
+					raise NotImplementedError(f'genir({node})')
+			return True
 
 		parse_module(self.path)
 		[typecheck(module) for module in modules]
@@ -434,7 +571,7 @@ class Parser:
 			if len(module.end):
 				ir.append(IR.FunctionCall(module.end[0].where, f'mod{module.index}end', 0))
 		ir.append(IR.ProgramLeave())
-		[genir(module) for module in modules]
+		[genir(module) and [genir(cmd) for cmd in module.cmd] for module in modules]
 		
 		self.modules = modules
 		self.ir = ir
@@ -454,6 +591,7 @@ class Linux_x86_64_NASM(Compiler):
 		@dataclass
 		class Entry:
 			off: int
+			size: int
 			name: str | None = None
 
 			def __str__(self):
@@ -468,21 +606,26 @@ class Linux_x86_64_NASM(Compiler):
 			def __post_init__(self):
 				self.entries = []
 
-			def push(self, size: int) -> Entry:
+			def push(self, size: int, name: str | None = None) -> Entry:
 				from math import ceil
 				self.off = ceil((self.off + size) / size) * size
 				self.max = max(self.off, self.max)
-				self.entries.append(Entry(self.off))
+				self.entries.append(Entry(self.off, size, name))
 				return self.entries[-1]
 			
 			def pop(self) -> Entry:
 				entry = self.entries.pop()
 				self.off = self.entries[-1].off if len(self.entries) else 0
 				return entry
+			
+			def find(self, name: str) -> Entry | None:
+				matches = [entry for entry in self.entries if entry.name == name]
+				return matches[0] if len(matches) else None
 
 		asm: list[str] = []
 		strs: list[str] = []
 		stack = Stack()
+		inout: int = 0
 
 		for code in self.parser.ir:
 			match type(code):
@@ -500,6 +643,17 @@ class Linux_x86_64_NASM(Compiler):
 						'  syscall'
 					]
 				case IR.FunctionCall:
+					off = stack.off
+					size = 0
+					for i in range(0, code.argc):
+						size += stack.pop().size
+					if code.argc > 0:
+						asm += [
+							f'  lea rsi, [rbp - {off}]',
+							f'  lea rdi, [inoutend - {off}]',
+							f'  mov rcx, {size}',
+							f'  rep movsb'
+						]
 					asm.append(f'  call {code.symbol}')
 				case IR.FunctionEnter:
 					stack = Stack()
@@ -517,6 +671,26 @@ class Linux_x86_64_NASM(Compiler):
 
 					from math import ceil
 					asm[asm.index("#STACKSIZE#")] = f'  sub rsp, {ceil(stack.max / 8) * 8}'
+				case IR.CopyArguments:
+					assert stack.off == 0
+					[stack.push(arg[1].size, arg[0]) for arg in code.args]
+					inout = max(inout, stack.off)
+					asm += [
+						f'  lea rsi, [inoutend - {stack.off}]', # src
+						f'  lea rdi, [rbp - {stack.off}]',
+						f'  mov rcx, {stack.off}',
+						f'  rep movsb'
+					]
+				case IR.CopyLocal:
+					src = stack.find(code.name)
+					assert src
+					dst = stack.push(src.size)
+					asm += [
+						f'  lea rsi, {src}',
+						f'  lea rdi, {dst}',
+						f'  mov rcx, {src.size}',
+						f'  rep movsb'
+					]
 				case IR.PushInteger:
 					asm += [
 						f'  mov rax, {code.value}',
@@ -541,6 +715,7 @@ class Linux_x86_64_NASM(Compiler):
 						f'  mov {stack.push(8)}, rax'
 					]
 				case _:
+					print(stack)
 					raise NotImplementedError(f'compile({code})')
 				
 		if len(strs):
@@ -550,6 +725,15 @@ class Linux_x86_64_NASM(Compiler):
 					f'str{i}:',
 					f'  db {', '.join(str(b) for b in list(strs[i]) + [0])}'
 				]
+
+		if inout > 0:
+			asm += [
+				'section .bss',
+				'inout:',
+				f'  resb {inout}',
+				'inoutend:',
+				f'  resb 0'
+			]
 		
 		if self.target == 'asm': open(self.output, 'w').write('\n'.join(asm))
 		else:
@@ -567,7 +751,7 @@ class Linux_x86_64_NASM(Compiler):
 
 if __name__ == '__main__':
 	import platform
-	from sys import argv
+	from sys import argv, exit
 
 	try:
 		asm = '-s' in argv
@@ -599,3 +783,4 @@ if __name__ == '__main__':
 		compiler = targets[target](Parser(argv[1]), 'exe' if not asm and not obj else 'obj' if obj else 'asm', argv[2])
 	except Error as e:
 		print(e.msg)
+		exit(1)

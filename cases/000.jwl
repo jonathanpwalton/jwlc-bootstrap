@@ -2,4 +2,4 @@ beg
 	JWLBUILTIN_SYSCALL3 1 1 'Starting now!\n' 14
 
 end
-	JWLBUILTIN_SYSCALL3 1 1 'Exiting now :(\n' 15
+	JWLBUILTIN_SYSCALL3 1 1 'Exiting now!\n' 15

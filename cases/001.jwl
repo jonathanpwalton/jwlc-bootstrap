@@ -1,0 +1,6 @@
+beg
+	write 1 'Hello world\n' 12
+	write 1 'This is command invocation!\n' 28
+
+cmd write fd buf cnt [] i64 ptr[u8] i64
+	JWLBUILTIN_SYSCALL3 1 fd buf cnt
