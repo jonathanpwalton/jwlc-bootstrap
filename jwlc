@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
-import string, platform
-from math import ceil
-from typing import Any, Self, override, Iterable
+from pprint import pprint
+from string import ascii_letters as ASCII_ALPHA, digits as ASCII_DIGIT
+from typing import Any, Literal, TypedDict, Callable, List
 from pathlib import Path
-from dataclasses import dataclass, field, replace
-from itertools import chain
+from tempfile import NamedTemporaryFile
+from subprocess import run
+from dataclasses import dataclass
 
-def flatten(iter: Iterable) -> list:
-	return list(chain.from_iterable(iter))
+class Dictionary(TypedDict):
+	__getattr__ = dict.get
+	__setattr__ = dict.__setitem__
+	__delattr__ = dict.__delitem__
 
 @dataclass
 class Error(BaseException):
@@ -20,11 +23,18 @@ class Where:
 	row: int
 	col: int
 
+	def __iter__(self):
+		return iter((self.src, self.row, self.col))
+
 	def error(self, msg: str):
-		raise Error(f'{self.src}:{self.row}:{self.col}: error: {msg}')
+		raise Error(f'\033[0m\033[1;97m{self.src}:{self.row}:{self.col}: \033[1;91merror: \033[0m{msg}')
 
 @dataclass
 class Tokens:
+	path: Path
+	tokens: 'list[Tokens.Token]' = None
+	index: int = 0
+
 	@dataclass
 	class Token:
 		where: Where
@@ -32,21 +42,17 @@ class Tokens:
 
 		def error(self, msg: str):
 			self.where.error(msg)
-
 	class Newline(Token): pass
 	class Indent(Token): pass
 	class Symbol(Token): pass
+	class Keyword(Token): pass
 	class Name(Token): pass
 	class Integer(Token): pass
 	class Scalar(Token): pass
 	class String(Token): complete: bool = False
 
-	path: Path
-	tokens: 'list[Tokens.Token]' = field(default_factory = lambda: [])
-	index: int = 0
-
 	def __post_init__(self):
-		if len(self.tokens): return
+		KEYWORDS = ['function', 'return']
 		self.tokens: 'list[Tokens.Token]' = [Tokens.Newline(Where(self.path, 0, 0), '\n')]
 
 		row = 1
@@ -70,12 +76,12 @@ class Tokens:
 					self.tokens[-1].value += ' '
 				else:
 					self.tokens.append(Tokens.Token(Where(self.path, row, col), ' '))
-			elif char in string.ascii_letters:
+			elif char in ASCII_ALPHA:
 				if type(self.tokens[-1]) is Tokens.Name:
 					self.tokens[-1].value += char
 				else:
 					self.tokens.append(Tokens.Name(Where(self.path, row, col), char))
-			elif char in string.digits:
+			elif char in ASCII_DIGIT:
 				if type(self.tokens[-1]) in [Tokens.Name, Tokens.Integer, Tokens.Scalar]:
 					self.tokens[-1].value += char
 				else:
@@ -91,7 +97,7 @@ class Tokens:
 
 			if char == '\n':
 				row += 1
-				col = 1
+				col = 0
 			col += 1
 
 		if type(self.tokens[-1]) is Tokens.String and not self.tokens[-1].complete:
@@ -111,18 +117,29 @@ class Tokens:
 			elif type(token) is Tokens.String:
 				token.value = token.value.encode('utf-8').decode('unicode_escape').encode('utf-8')
 				del token.complete
+			elif type(token) is Tokens.Name and token.value in KEYWORDS:
+				token = Tokens.Keyword(token.where, token.value)
 			return token
 
 		self.tokens = [revalue(token) for token in self.tokens if type(token) is not Tokens.Token]
 
 	def error(self, msg: str):
-		self.tokens[-1].error(msg) if self.index >= len(self.tokens) else self.front().error(msg)
+		Where(self.path, self.tokens[-1].where.row, self.tokens[-1].where.col + len(self.tokens[-1].value)) if self.index >= len(self.tokens) else self.front().error(msg)
 
 	def empty(self) -> bool:
 		return self.index >= len(self.tokens)
+	
+	def __len__(self) -> int:
+		return len(self.tokens)
 
 	def front(self) -> 'Tokens.Token | None':
 		return self.tokens[self.index] if self.index < len(self.tokens) else None
+	
+	def value(self) -> str:
+		return self.front().value if self.front() else None
+	
+	def where(self) -> Where:
+		return self.front().where if self.front() else None
 
 	def expect(self, *values: str | type) -> 'Tokens.Token | list[Tokens.Token]':
 		assert len(values) and all([type(x) for x in values])
@@ -148,353 +165,437 @@ class Tokens:
 	
 	def remaining(self) -> int:
 		return abs(len(self.tokens) - self.index)
-
-@dataclass
-class Types:
-	types: 'dict[str, Types.Type]' = None
-
-	def __post_init__(self):
-		self.types = {
-			'u8' : Types.Integer('u8',  1, True),
-			'u16': Types.Integer('u16', 2, True),
-			'u32': Types.Integer('u32', 4, True),
-			'u64': Types.Integer('u64', 8, True),
-			'i8' : Types.Integer('i8',  1, True),
-			'i16': Types.Integer('i16', 2, True),
-			'i32': Types.Integer('i32', 4, True),
-			'i64': Types.Integer('i64', 8, True),
-			'ptr': Types.Pointer('ptr', 8, None),
-		}
-
-	def get(self, name: str) -> 'Types.Type | None':
-		return self.types.get(name, None)
 	
-	def ptr(self, value: 'Types.Type') -> 'Types.Type':
-		assert isinstance(value, Types.Type)
-		return Types.Pointer('ptr', 8, value)
+	def type(self) -> type:
+		return type(self.front())
 
-	def fun(self, input: list['Types.Type'], output: 'Types.Type') -> 'Types.Type':
-		assert all([isinstance(i, Types.Type) for i in input + [output]])
-		return Types.Function(f'fun', 8, input, output)
-
+class Types:
 	@dataclass
 	class Type:
 		name: str
 		size: int
 
+		def __str__(self):
+			return self.name
+
 	@dataclass
 	class Integer(Type):
-		signed: bool
-
-	@dataclass
-	class Scalar(Type):
-		pass
-
-	@dataclass
-	class Function(Type):
-		input: 'list[Types.Type]'
-		output: 'Types.Type'
+		name: Literal['u8', 'u16', 'u32', 'u64', 'i8', 'i16', 'i32', 'i64']
+		size: Literal[1, 2, 4, 8]
 
 	@dataclass
 	class Pointer(Type):
-		value: 'Types.Type'
+		name: Literal['ptr']
+		size: Literal[8]
+		value: 'Types.Type | None'
 
-class Instructions:
+		def __str__(self):
+			return f'ptr[{self.value}]'
+
 	@dataclass
-	class Instruction:
+	class Command(Type):
+		name: Literal['cmd']
+		size: Literal[8]
+		input: list['Types.Type']
+		output: 'Types.Type | None'
+
+	@dataclass
+	class IntegerOrPointer(Type):
+		def __eq__(self, value):
+			return type(value) in [Types.Pointer, Types.Integer] and value.size == 8
+		
+		def __str__(self):
+			return 'u64, i64, or ptr'
+
+	u8  = Integer('u8',  1)
+	u16 = Integer('u16', 2)
+	u32 = Integer('u32', 4)
+	u64 = Integer('u64', 8)
+	i8  = Integer('i8',  1)
+	i16 = Integer('i16', 2)
+	i32 = Integer('i32', 4)
+	i64 = Integer('i64', 8)
+	ptr: Callable[[Type | None], Pointer] = lambda v: Types.Pointer('ptr', 8, v)
+	cmd: Callable[[list[Type], Type | None], Command] = lambda inp, out: Types.Command('cmd', 8, inp, out)
+
+	iop = IntegerOrPointer('iop', 8)
+
+class IR:
+	@dataclass
+	class Code:
 		where: Where
-
 	@dataclass
-	class FunctionEnter(Instruction):
+	class ProgramEnter():
+		modulesc: int
+	@dataclass
+	class ProgramLeave():
+		pass
+	@dataclass
+	class FunctionEnter(Code):
 		symbol: str
-
 	@dataclass
-	class FunctionLeave(Instruction):
+	class FunctionLeave(Code):
 		symbol: str
-
 	@dataclass
-	class Syscall(Instruction):
+	class FunctionCall(Code):
+		symbol: str
 		argc: int
-
 	@dataclass
-	class PushInteger(Instruction):
+	class Syscall(Code):
+		argc: int
+	@dataclass
+	class PushInteger(Code):
 		value: int
-
 	@dataclass
-	class PushString(Instruction):
-		value: int
-
-@dataclass
-class Nodes:
-	path: Path
-	instructions: list[Instructions.Instruction] = field(default_factory = lambda: [])
-
-	def __post_init__(self):
-		paths: list[str] = []
-		files: list['Nodes.Scope'] = []
-		functions: list[list[Instructions.Instruction]] = []
-
-		def compile(path: Path):
-			if path in paths:
-				return
-			paths.append(path)
-			
-			file = Nodes.Scope.parse(Tokens(path), 0)
-			file.types = Types()
-			file.type_assign(None)
-			functions.append([
-				Instructions.FunctionEnter(file.where, f'file{len(functions)}')
-			] + file.compile(functions) + [
-				Instructions.FunctionLeave(file.where, f'file{len(functions)}')
-			])
-			files.append(file)
-			
-		compile(self.path)
-		self.instructions = flatten(functions)
-
-	@dataclass
-	class Node:
-		where: Where
-
-		@classmethod
-		def parse(cls, tokens: Tokens):
-			raise NotImplementedError(cls, 'Node.parse()')
-		
-		def type_assign(self, scope: Self):
-			raise NotImplementedError(self.__class__, 'Node.type_assign()')
-		
-		def compile(self) -> list[Instructions.Instruction]:
-			raise NotImplementedError(self.__class__, 'Node.compile()')
-
-	@dataclass
-	class Scope(Node):
-		statements: 'list[Nodes.Statement]'
-		types: Types = None
-
-		@override
-		@classmethod
-		def parse(cls, tokens: Tokens, indent: int) -> Self:
-			statements: list[Nodes.Statement] = []
-			where = tokens.front().where
-			
-			if len(tokens.tokens) > 1:
-				while True:
-					if indent > 0:
-						i = tokens.expect(Tokens.Indent)
-						i.error('unexpected indentation level') if len(i.value) != indent else None
-					statements.append(Nodes.Statement.parse(tokens, indent))
-					if tokens.empty() or (indent > 0 and type(tokens.front()) is not Tokens.Indent):
-						break
-
-			return Nodes.Scope(where, statements)
-		
-		@override
-		def type_assign(self, scope: 'Nodes.Scope'):
-			[statement.type_assign(self) for statement in self.statements]
-
-		@override
-		def compile(self, functions: list[Instructions.Instruction]) -> list[Instructions.Instruction]:
-			# TODO: compile functions existing within this scope
-			return flatten(statement.compile() for statement in self.statements)
-
-	class Statement(Node):
-		@override
-		@classmethod
-		def parse(cls, tokens: Tokens, indent: int):
-			return tokens.follow(Nodes.Expression.parse(tokens), Tokens.Newline)
-
-	class Expression(Node):
-		type: Types.Type = None
-
-		def __init__(self):
-			raise ValueError
-
-		@override
-		@classmethod
-		def parse(cls, tokens: Tokens):
-			return Nodes.Command.parse(tokens)
-		
-	@dataclass
-	class Command(Node):
-		lhs: 'Nodes.Expression'
-		rhs: 'list[Nodes.Expression]'
-
-		@override
-		@classmethod
-		def parse(cls, tokens: Tokens):
-			lhs = Nodes.Primary.parse(tokens)
-			rhs = []
-
-			while not tokens.empty() and type(tokens.front()) not in [Tokens.Newline, Tokens.Symbol, Tokens.Indent]:
-				rhs.append(Nodes.Primary.parse(tokens))
-
-			return Nodes.Command(lhs.where, lhs, rhs)
-		
-		@override
-		def compile(self) -> list[Instructions.Instruction]:
-			return flatten(rhs.compile() for rhs in self.rhs) + self.lhs.compile()
-		
-		@override
-		def type_assign(self, scope: 'Nodes.Scope'):
-			[expr.type_assign(scope) for expr in self.rhs]
-			self.lhs.type_assign(scope)
-
-	class Primary(Node):
-		@override
-		@classmethod
-		def parse(cls, tokens: Tokens):
-			if type(tokens.front()) is Tokens.Name:
-				name = tokens.expect(Tokens.Name)
-				if name.value.startswith('JWLBUILTIN_'):
-					match name.value:
-						case 'JWLBUILTIN_SYSCALL3':
-							return Nodes.BuiltinCommand(name.where, name.value)
-						case _:
-							name.error(f'unknown builtin `{name.value}`')
-				else:
-					return Nodes.Identifier(name.where, name.value)
-			elif type(tokens.front()) is Tokens.Integer:
-				return Nodes.Integer(tokens.front().where, tokens.expect(Tokens.Integer).value)
-			elif type(tokens.front()) is Tokens.String:
-				return Nodes.String(tokens.front().where, tokens.expect(Tokens.String).value)
-			else:
-				tokens.error(f'expected expression but found {f'{type(tokens.front()).__name__} `{tokens.front().value}`' if not tokens.empty() else 'end of input'}')
-
-	@dataclass
-	class BuiltinCommand(Node):
-		name: str
-		type: Any = None
-
-		@override
-		def type_assign(self, scope: 'Nodes.Scope'):
-			match self.name:
-				case 'JWLBUILTIN_SYSCALL3':
-					self.type = scope.types.fun([scope.types.get('u64'), scope.types.get('u64'), scope.types.get('u64'), scope.types.get('u64'), scope.types.get('u64')], scope.types.get('u64'))
-				case _:
-					assert False
-
-		@override
-		def compile(self):
-			match self.name:
-				case 'JWLBUILTIN_SYSCALL3':
-					return [Instructions.Syscall(self.where, 3)]
-				case _:
-					assert False
-
-	@dataclass
-	class Identifier(Node):
+	class PushString(Code):
 		value: str
 
+@dataclass
+class Parser:
+	path: Path
+	modules: list['Parser.Module'] = None
+	ir: list[IR.Code] = None
+
 	@dataclass
-	class Integer(Node):
+	class IntegerExpression:
+		where: Where
 		value: int
 		type: Types.Type = None
-
-		@override
-		def type_assign(self, scope: 'Nodes.Scope'):
-			self.type = scope.types.get('i64')
-
-		@override
-		def compile(self):
-			return [Instructions.PushInteger(self.where, self.value)]
-
 	@dataclass
-	class String(Node):
+	class StringExpression:
+		where: Where
 		value: bytes
 		type: Types.Type = None
+	@dataclass
+	class NameExpression:
+		where: Where
+		value: str
+		type: Types.Type = None
+	@dataclass
+	class BuiltinExpression:
+		BUILTINS = Literal['JWLBUILTIN_SYSCALL3']
+		where: Where
+		value: BUILTINS
+		type: Types.Type = None
+	PrimaryExpression = BuiltinExpression | NameExpression | StringExpression | IntegerExpression
+	@dataclass
+	class CommandExpression:
+		where: Where
+		lhs: 'Parser.PrimaryExpression'
+		rhs: list['Parser.PrimaryExpression']
+	Expression = CommandExpression | PrimaryExpression
+	Statement = Expression
+	IndentedBlock = list[Statement]
+	@dataclass
+	class Module:
+		path: str
+		index: int
+		beg: 'Parser.IndentedBlock'
+		end: 'Parser.IndentedBlock'
 
-		@override
-		def type_assign(self, scope: 'Nodes.Scope'):
-			self.type = scope.types.ptr(scope.types.get('u8'))
+	def __post_init__(self):
+		modules: list[Parser.Module] = []
+		ir: list[IR.Code] = []
 
-		@override
-		def compile(self):
-			return [Instructions.PushString(self.where, self.value)]
+		def parse_module(path: Path):
+			tokens = Tokens(path)
+			beg: Parser.IndentedBlock = []
+			end: Parser.IndentedBlock = []
 
-class Targets:
-	class x86_64_Linux:
-		def __init__(self, path: Path):
-			self.fun: list[str] = []
-			self.str: list[bytes] = []
-			self.off: tuple[int, int] = (0, 0)
+			while tokens.value() == 'import':
+				raise NotImplementedError
+			
+			if tokens.value() == 'beg':
+				tokens.expect('beg', Tokens.Newline)
+				beg = parse_indented_block(tokens, 0)
 
-			nodes = Nodes(path)
-			self.asm = [
-				'default rel',
-				'global _start',
-				'',
-				'section .text',
-				'_start:',
-			] + [f'	call {file.symbol}' for file in nodes.instructions if type(file) is Instructions.FunctionEnter and file.symbol.startswith('file')] + [
-				'	mov rdi, 0',
-				'	mov rax, 60',
-				'	syscall'
-			]
-			[self.compile(ir) for ir in nodes.instructions]
+			if tokens.value() == 'end':
+				tokens.expect('end', Tokens.Newline)
+				end = parse_indented_block(tokens, 0)
 
-			self.asm.append('\nsection .data')
-			for i in range(0, len(self.str)): self.asm.append(f'str{i}:\n\tdb {', '.join(str(b) for b in list(self.str[i]) + [0])}')
+			while tokens.value():
+				raise NotImplementedError
 
-		def push(self, size: int) -> str:
-			self.off = (self.off[0] + size, max(self.off[1], self.off[0] + size))
-			return f'[rbp - {self.off[0]}]'
+			modules.append(Parser.Module(path, len(modules), beg, end))
+
+		def parse_indented_block(tokens: Tokens, level: int) -> Parser.IndentedBlock:
+			statements = Parser.IndentedBlock()
+			
+			if tokens.type() is Tokens.Indent:
+				if len(tokens.value()) <= level:
+					tokens.front().error(f'expected indented block of level {level + 1} or higher, found level {level}')
+				level = len(tokens.value())
+
+				while tokens.type() is Tokens.Indent and len(tokens.value()) == level:
+					tokens.expect(Tokens.Indent)
+					statements.append(parse_statement(tokens, level))
+
+			return statements
+
+		def parse_statement(tokens: Tokens, level: int) -> Parser.Statement:
+			return tokens.follow(parse_expression(tokens), Tokens.Newline)
+
+		def parse_expression(tokens: Tokens) -> Parser.Expression:
+			return parse_command_expression(tokens)
+
+		def parse_command_expression(tokens: Tokens) -> Parser.CommandExpression:
+			lhs = parse_primary_expression(tokens)
+
+			while tokens.type() not in [Tokens.Newline, Tokens.Indent, Tokens.Symbol]:
+				if type(lhs) is not Parser.CommandExpression:
+					lhs = Parser.CommandExpression(lhs.where, lhs, [])
+				lhs.rhs.append(parse_primary_expression(tokens))
+
+			return lhs
+
+		def parse_primary_expression(tokens: Tokens) -> Parser.PrimaryExpression:
+			if tokens.type() is Tokens.Name:
+				if tokens.value().startswith('JWLBUILTIN_'):
+					if (tokens.value().startswith('JWLBUILTIN_SYSCALL') and not tokens.value()[18:].isdigit()) or \
+					tokens.value() not in Parser.BuiltinExpression.BUILTINS.__args__:
+						tokens.error(f'no such builtin `{tokens.value()}`')
+					return Parser.BuiltinExpression(tokens.where(), tokens.expect(Tokens.Name).value)
+				else:
+					return Parser.NameExpression(tokens.where(), tokens.expect(Tokens.Name).value)
+			elif tokens.type() is Tokens.Integer:
+				return Parser.IntegerExpression(tokens.where(), tokens.expect(Tokens.Integer).value)
+			elif tokens.type() is Tokens.String:
+				return Parser.StringExpression(tokens.where(), tokens.expect(Tokens.String).value)
+			else:
+				tokens.error('expected expression')
+
+		def typecheck(node: Parser.Module | Parser.Statement):
+			match type(node):
+				case Parser.Module:
+					[typecheck(statement) for statement in node.beg]
+					[typecheck(statement) for statement in node.end]
+				case Parser.CommandExpression:
+					[typecheck(expression) for expression in node.rhs]
+					typecheck(node.lhs)
+					if type(node.lhs.type) is not Types.Command:
+						node.where.error(f'invalid left-hand side type for command expression: expected type `cmd` but found `{node.lhs.type}`')
+					elif len(node.rhs) != len(node.lhs.type.input):
+						node.where.error('argument-parameter count mismatch')
+					for i in range(0, len(node.rhs)):
+						if (node.lhs.type.input[i] != node.rhs[i].type):
+							node.rhs[i].where.error(f'argument-parameter type mismatch: expected type `{node.lhs.type.input[i]}` but found `{node.rhs[i].type}`')
+					node.type = node.lhs.type.output
+				case Parser.IntegerExpression:
+					node.type = Types.i64
+				case Parser.StringExpression:
+					node.type = Types.ptr(Types.u8)
+				case Parser.BuiltinExpression:
+					match node.value:
+						case node.value if node.value.startswith('JWLBUILTIN_SYSCALL'):
+							node.type = Types.cmd([Types.i64] + [Types.iop] * int(node.value[18:]), Types.i64)
+						case _:
+							raise NotImplementedError(f'typecheck({node.value})')
+				case _:
+					raise NotImplementedError(f'typecheck({type(node)})')
+
+		def genir(node: Parser.Module | Parser.Statement):
+			match type(node):
+				case Parser.Module:
+					if len(node.beg):
+						ir.append(IR.FunctionEnter(node.beg[0].where, f'mod{node.index}beg'))
+						[genir(statement) for statement in node.beg]
+						ir.append(IR.FunctionLeave(node.beg[-1].where, f'mod{node.index}beg'))
+
+					if len(node.end):
+						ir.append(IR.FunctionEnter(node.end[0].where, f'mod{node.index}end'))
+						[genir(statement) for statement in node.end]
+						ir.append(IR.FunctionLeave(node.end[-1].where, f'mod{node.index}end'))
+				case Parser.CommandExpression:
+					[genir(rhs) for rhs in node.rhs]
+					genir(node.lhs)
+					if type(node.lhs) is not Parser.BuiltinExpression:
+						raise NotImplementedError
+				case Parser.IntegerExpression:
+					ir.append(IR.PushInteger(node.where, node.value))
+				case Parser.StringExpression:
+					ir.append(IR.PushString(node.where, node.value))
+				case Parser.BuiltinExpression:
+					match node.value:
+						case node.value if node.value.startswith('JWLBUILTIN_SYSCALL'):
+							ir.append(IR.Syscall(node.where, int(node.value[18:])))
+						case _:
+							raise NotImplementedError(f'genir({node.value})')
+				case _:
+					raise NotImplementedError(f'genir({type(node)})')
+
+		parse_module(self.path)
+		[typecheck(module) for module in modules]
 		
-		def pop(self, size: int) -> str:
-			off = self.off[0]
-			self.off = (self.off[0] - size, self.off[1])
-			return f'[rbp - {off}]'
+		ir.append(IR.ProgramEnter(len(modules)))
+		for module in modules:
+			if len(module.beg):
+				ir.append(IR.FunctionCall(module.beg[0].where, f'mod{module.index}beg', 0))
+		for module in reversed(modules):
+			if len(module.end):
+				ir.append(IR.FunctionCall(module.end[0].where, f'mod{module.index}end', 0))
+		ir.append(IR.ProgramLeave())
+		[genir(module) for module in modules]
 		
-		def compile(self, ir: Instructions.Instruction):
-			match type(ir):
-				case Instructions.FunctionEnter:
-					self.off = (0, 0)
-					self.fun = [
-						f'{ir.symbol}:',
-						f'push rbp',
-						f'mov rbp, rsp',
-						f'#STACKSIZE#'
-					]
-				case Instructions.FunctionLeave:
-					if self.off[1] > 0:
-						self.fun[self.fun.index('#STACKSIZE#')] = f'sub rsp, {ceil(self.off[1] / 8) * 8}'
-					else:
-						self.fun.remove('#STACKSIZE#')
+		self.modules = modules
+		self.ir = ir
 
-					self.fun += [
-						f'leave',
-						f'ret'
+@dataclass
+class Compiler:
+	parser: Parser
+	target: Literal['exe', 'asm', 'obj']
+	output: Path
+
+	def __post_init__(self):
+		raise NotImplementedError(self.__class__)
+
+@dataclass
+class Linux_x86_64_NASM(Compiler):
+	def __post_init__(self):
+		@dataclass
+		class Entry:
+			off: int
+			name: str | None = None
+
+			def __str__(self):
+				return f'[rbp - {self.off}]'
+
+		@dataclass
+		class Stack:
+			off: int = 0
+			max: int = 0
+			entries: list[Entry] = None
+
+			def __post_init__(self):
+				self.entries = []
+
+			def push(self, size: int) -> Entry:
+				from math import ceil
+				self.off = ceil((self.off + size) / size) * size
+				self.max = max(self.off, self.max)
+				self.entries.append(Entry(self.off))
+				return self.entries[-1]
+			
+			def pop(self) -> Entry:
+				entry = self.entries.pop()
+				self.off = self.entries[-1].off if len(self.entries) else 0
+				return entry
+
+		asm: list[str] = []
+		strs: list[str] = []
+		stack = Stack()
+
+		for code in self.parser.ir:
+			match type(code):
+				case IR.ProgramEnter:
+					asm = [
+						'default rel',
+						'global _start',
+						'section .text',
+						'_start:'
 					]
-					self.asm += [self.fun[0]] + [f'	{s}' for s in self.fun[1:]]
-					self.fun = []
-				case Instructions.PushInteger:
-					self.fun += [
-						f'mov rax, {ir.value}',
-						f'mov {self.push(8)}, rax'
+				case IR.ProgramLeave:
+					asm += [
+						'  mov rdi, 0',
+						'  mov rax, 60',
+						'  syscall'
 					]
-				case Instructions.PushString:
-					if ir.value not in self.str: self.str.append(ir.value)
-					self.fun += [
-						f'lea rax, str{self.str.index(ir.value)}',
-						f'mov {self.push(8)}, rax'
+				case IR.FunctionCall:
+					asm.append(f'  call {code.symbol}')
+				case IR.FunctionEnter:
+					stack = Stack()
+					asm += [
+						f'{code.symbol}:',
+						'  push rbp',
+						'  mov rbp, rsp',
+						'#STACKSIZE#'
 					]
-				case Instructions.Syscall:
-					for i in range(ir.argc - 1, -1, -1):
-						regs = ('rdi', 'rsi', 'rdx', 'r10', 'r8', 'r9')
-						self.fun.append(f'mov {regs[i]}, {self.pop(8)}')
-					self.fun += [
-						f'mov rax, {self.pop(8)}',
-						f'syscall',
-						f'mov {self.push(8)}, rax'
+				case IR.FunctionLeave:
+					asm += [
+						'  leave',
+						'  ret'
+					]
+
+					from math import ceil
+					asm[asm.index("#STACKSIZE#")] = f'  sub rsp, {ceil(stack.max / 8) * 8}'
+				case IR.PushInteger:
+					asm += [
+						f'  mov rax, {code.value}',
+						f'  mov {stack.push(8)}, rax'
+					]
+				case IR.PushString:
+					if code.value not in strs:
+						strs.append(code.value)
+					asm += [
+						f'  lea rax, str{strs.index(code.value)}',
+						f'  mov {stack.push(8)}, rax'
+					]
+				case IR.Syscall:
+					for i in range(code.argc - 1, -1, -1):
+						if i > 5:
+							code.where.error('Linux x86_64 only supports syscalls with up to 6 arguments')
+						reg = ('rdi', 'rsi', 'rdx', 'r10', 'r8', 'r9')[i]
+						asm.append(f'  mov {reg}, {stack.pop()}')
+					asm += [
+						f'  mov rax, {stack.pop()}',
+						f'  syscall',
+						f'  mov {stack.push(8)}, rax'
 					]
 				case _:
-					raise NotImplementedError(type(ir))
+					raise NotImplementedError(f'compile({code})')
+				
+		if len(strs):
+			asm.append('section .data')
+			for i in range(0, len(strs)):
+				asm += [
+					f'str{i}:',
+					f'  db {', '.join(str(b) for b in list(strs[i]) + [0])}'
+				]
+		
+		if self.target == 'asm': open(self.output, 'w').write('\n'.join(asm))
+		else:
+			temp = NamedTemporaryFile('w', delete_on_close=False)
+			temp.write('\n'.join(asm))
+			temp.close()
+			
+			if self.target == 'obj':
+				run(['nasm', '-f', 'elf64', '-o', self.output, temp.name])
+			else:
+				temp2 = NamedTemporaryFile('w', delete_on_close=False)
+				temp2.close()
+				run(['nasm', '-f', 'elf64', '-o', temp2.name, temp.name])
+				run(['ld', '-o', self.output, temp2.name])
 
 if __name__ == '__main__':
+	import platform
+	from sys import argv
+
 	try:
-		match f'{platform.machine()}_{platform.system()}':
-			case 'x86_64_Linux':
-				print('\n'.join(Targets.x86_64_Linux('./cases/000.jwl').asm))
-			case _:
-				raise Error(f'error: unsupported platform `{platform.system()} {platform.machine()}`')
+		asm = '-s' in argv
+		obj = '-o' in argv
+
+		while '-s' in argv: argv.remove('-s')
+		while '-o' in argv: argv.remove('-o')
+
+		if asm and obj:
+			raise Error('error: only one of [-s | -o] may be provided')
+
+		if len(argv) != 3:
+			raise Error(
+				f'usage: {argv[0]} [-s | -o] <input> <output>\n'
+				'\n'
+				'options:\n'
+				'  -s      write assembly to <output>\n'
+				'  -o      write assembler\'s output to <output>'
+			)
+		
+		target = f'{platform.system()}-{platform.machine()}'
+		targets: dict[str, type[Compiler]] = {
+			'Linux-x86_64': Linux_x86_64_NASM
+		}
+
+		if target not in targets:
+			raise Error(f'error: unsupported platform `{platform.system()} {platform.machine()}`')
+		
+		compiler = targets[target](Parser(argv[1]), 'exe' if not asm and not obj else 'obj' if obj else 'asm', argv[2])
 	except Error as e:
 		print(e.msg)
