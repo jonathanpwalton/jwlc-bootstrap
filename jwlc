@@ -1,786 +1,238 @@
-#!/usr/bin/env python3
-
-from copy import deepcopy
-from string import ascii_letters as ASCII_ALPHA, digits as ASCII_DIGIT
-from typing import Any, Literal, TypedDict, Callable, List
-from pathlib import Path
-from tempfile import NamedTemporaryFile
-from subprocess import run
-from dataclasses import dataclass, field
-
-class Dictionary(TypedDict):
-	__getattr__ = dict.get
-	__setattr__ = dict.__setitem__
-	__delattr__ = dict.__delitem__
-
-@dataclass
-class Error(BaseException):
-	msg: str
-
-@dataclass
-class Where:
-	src: Path
-	row: int
-	col: int
-
-	def __iter__(self):
-		return iter((self.src, self.row, self.col))
-
-	def error(self, msg: str):
-		raise Error(f'\033[0m\033[1;97m{self.src}:{self.row}:{self.col}: \033[1;91merror: \033[0m{msg}')
-
-@dataclass
-class Tokens:
-	path: Path
-	tokens: 'list[Tokens.Token]' = None
-	index: int = 0
-
-	@dataclass
-	class Token:
-		where: Where
-		value: str | float | int | bytes
-
-		def error(self, msg: str):
-			self.where.error(msg)
-	class Newline(Token): pass
-	class Indent(Token): pass
-	class Symbol(Token): pass
-	class Keyword(Token): pass
-	class Name(Token): pass
-	class Integer(Token): pass
-	class Scalar(Token): pass
-	class String(Token): complete: bool = False
-
-	def __post_init__(self):
-		KEYWORDS = ['function', 'return']
-		self.tokens: 'list[Tokens.Token]' = [Tokens.Newline(Where(self.path, 0, 0), '\n')]
-
-		row = 1
-		col = 1
-		for char in open(self.path).read():
-			if type(self.tokens[-1]) is Tokens.String and not self.tokens[-1].complete:
-				if char in ['"', "'"] and not self.tokens[-1].value.endswith('\\'):
-					self.tokens[-1].complete = True
-				else:
-					self.tokens[-1].value += char
-			elif char == '\n':
-				if type(self.tokens[-1]) is not Tokens.Newline:
-					if type(self.tokens[-1]) is Tokens.Indent:
-						self.tokens.pop()
-					else:
-						self.tokens.append(Tokens.Newline(Where(self.path, row, col), char))
-			elif char.isspace():
-				if type(self.tokens[-1]) is Tokens.Newline:
-					self.tokens.append(Tokens.Indent(Where(self.path, row, col), ' '))
-				elif type(self.tokens[-1]) is Tokens.Indent:
-					self.tokens[-1].value += ' '
-				else:
-					self.tokens.append(Tokens.Token(Where(self.path, row, col), ' '))
-			elif char in ASCII_ALPHA:
-				if type(self.tokens[-1]) is Tokens.Name:
-					self.tokens[-1].value += char
-				else:
-					self.tokens.append(Tokens.Name(Where(self.path, row, col), char))
-			elif char in ASCII_DIGIT:
-				if type(self.tokens[-1]) in [Tokens.Name, Tokens.Integer, Tokens.Scalar]:
-					self.tokens[-1].value += char
-				else:
-					self.tokens.append(Tokens.Integer(Where(self.path, row, col), char))
-			elif char in ["'", '"']:
-				self.tokens.append(Tokens.String(Where(self.path, row, col), ''))
-			elif char == '_' and type(self.tokens[-1]) is Tokens.Name:
-				self.tokens[-1].value += char
-			elif char == '.' and type(self.tokens[-1]) is Tokens.Integer:
-				self.tokens[-1] = Tokens.Scalar(self.tokens[-1].where, self.tokens[-1].value + '.')
-			else:
-				self.tokens.append(Tokens.Symbol(Where(self.path, row, col), char))
-
-			if char == '\n':
-				row += 1
-				col = 0
-			col += 1
-
-		if type(self.tokens[-1]) is Tokens.String and not self.tokens[-1].complete:
-			self.tokens[-1].error('unclosed string literal')
-		elif type(self.tokens[-1]) is Tokens.Indent:
-			self.tokens.pop()
-
-		self.tokens = self.tokens[1:]
-		if len(self.tokens) == 0 or type(self.tokens[-1]) is not Tokens.Newline:
-			self.tokens.append(Tokens.Newline(Where(self.path, row, col), '\n'))
-
-		def revalue(token: 'Tokens.Token') -> 'Tokens.Token':
-			if type(token) is Tokens.Integer:
-				token.value = int(token.value)
-			elif type(token) is Tokens.Scalar:
-				token.value = float(token.value)
-			elif type(token) is Tokens.String:
-				token.value = token.value.encode('utf-8').decode('unicode_escape').encode('utf-8')
-				del token.complete
-			elif type(token) is Tokens.Name and token.value in KEYWORDS:
-				token = Tokens.Keyword(token.where, token.value)
-			return token
-
-		self.tokens = [revalue(token) for token in self.tokens if type(token) is not Tokens.Token]
-
-	def error(self, msg: str):
-		Where(self.path, self.tokens[-1].where.row, self.tokens[-1].where.col + len(self.tokens[-1].value)) if self.index >= len(self.tokens) else self.front().error(msg)
-
-	def empty(self) -> bool:
-		return self.index >= len(self.tokens)
-	
-	def __len__(self) -> int:
-		return len(self.tokens)
-
-	def front(self) -> 'Tokens.Token | None':
-		return self.tokens[self.index] if self.index < len(self.tokens) else None
-	
-	def value(self) -> str:
-		return self.front().value if self.front() else None
-	
-	def where(self) -> Where:
-		return self.front().where if self.front() else None
-
-	def expect(self, *values: str | type) -> 'Tokens.Token | list[Tokens.Token]':
-		assert len(values) and all([type(x) for x in values])
-		
-		def rep(value: str | type):
-			return value.__name__ if type(value) is type else repr(value)
-
-		ret: 'list[Tokens.Token]' = []
-		for value in values:
-			if self.index >= len(self.tokens):
-				self.error(f'expected {rep(value)} but reached end of input')
-			elif type(value) is str and self.tokens[self.index].value != value:
-				self.error(f'expected {rep(value)} but found {rep(self.tokens[self.index].value)}')
-			elif type(value) is type and type(self.tokens[self.index]) != value:
-				self.error(f'expected {rep(value)} but found {rep(type(self.tokens[self.index]))}')
-			ret.append(self.tokens[self.index])
-			self.index += 1
-		return ret[0] if len(ret) == 1 else ret
-	
-	def follow(self, value: Any, *expected: str | type) -> Any:
-		self.expect(*expected)
-		return value
-	
-	def remaining(self) -> int:
-		return abs(len(self.tokens) - self.index)
-	
-	def type(self) -> type:
-		return type(self.front())
-
-class Types:
-	@dataclass
-	class Type:
-		name: str
-		size: int
-
-		def __str__(self):
-			return self.name
-
-	@dataclass
-	class Integer(Type):
-		name: Literal['u8', 'u16', 'u32', 'u64', 'i8', 'i16', 'i32', 'i64']
-		size: Literal[1, 2, 4, 8]
-
-	@dataclass
-	class Pointer(Type):
-		name: Literal['ptr']
-		size: Literal[8]
-		value: 'Types.Type | None'
-
-		def __str__(self):
-			return f'ptr[{self.value}]'
-
-	@dataclass
-	class Command(Type):
-		name: Literal['cmd']
-		size: Literal[8]
-		input: list['Types.Type']
-		output: 'Types.Type | None'
-
-	@dataclass
-	class IntegerOrPointer(Type):
-		def __eq__(self, value):
-			return type(value) in [Types.Pointer, Types.Integer] and value.size == 8
-		
-		def __str__(self):
-			return 'u64, i64, or ptr'
-
-	builtin = {
-		'u8' : Integer('u8',  1),
-		'u16': Integer('u16', 2),
-		'u32': Integer('u32', 4),
-		'u64': Integer('u64', 8),
-		'i8' : Integer('i8',  1),
-		'i16': Integer('i16', 2),
-		'i32': Integer('i32', 4),
-		'i64': Integer('i64', 8),
-		'ptr': lambda v: Types.Pointer('ptr', 8, v),
-	}
-	cmd: Callable[[list[Type], Type | None], Command] = lambda inp, out: Types.Command('cmd', 8, inp, out)
-	iop = IntegerOrPointer('iop', 8)
-
-class IR:
-	@dataclass
-	class Code:
-		where: Where
-	@dataclass
-	class ProgramEnter():
-		modulesc: int
-	@dataclass
-	class ProgramLeave():
-		pass
-	@dataclass
-	class FunctionEnter(Code):
-		symbol: str
-	@dataclass
-	class FunctionLeave(Code):
-		symbol: str
-	@dataclass
-	class FunctionCall(Code):
-		symbol: str
-		argc: int
-	@dataclass
-	class Syscall(Code):
-		argc: int
-	@dataclass
-	class PushInteger(Code):
-		value: int
-	@dataclass
-	class PushString(Code):
-		value: str
-	@dataclass
-	class CopyLocal(Code):
-		name: str
-	@dataclass
-	class CopyArguments(Code):
-		args: list[tuple[str, Types.Type]]
-
-@dataclass
-class Parser:
-	path: Path
-	modules: list['Parser.Module'] = None
-	ir: list[IR.Code] = None
-
-	@dataclass
-	class TypeSpecifier:
-		where: Where
-		name: str
-		template: list['Parser.TypeSpecifier'] = field(default_factory=lambda: [])
-		type: Types.Type = None
-	@dataclass
-	class IntegerExpression:
-		where: Where
-		value: int
-		type: Types.Type = None
-	@dataclass
-	class StringExpression:
-		where: Where
-		value: bytes
-		type: Types.Type = None
-	@dataclass
-	class NameExpression:
-		where: Where
-		value: str
-		type: Types.Type = None
-		cmdid: int = None
-		gblid: int = None
-	@dataclass
-	class BuiltinExpression:
-		BUILTINS = Literal['JWLBUILTIN_SYSCALL3']
-		where: Where
-		value: BUILTINS
-		type: Types.Type = None
-	PrimaryExpression = BuiltinExpression | NameExpression | StringExpression | IntegerExpression
-	@dataclass
-	class CommandExpression:
-		where: Where
-		lhs: 'Parser.PrimaryExpression'
-		rhs: list['Parser.PrimaryExpression']
-	Expression = CommandExpression | PrimaryExpression
-	Statement = Expression
-	@dataclass
-	class CommandDefinition:
-		where: Where
-		name: str
-		index: int
-		input: dict[str, 'Parser.TypeSpecifier'] = field(default_factory=lambda: {})
-		output: 'Parser.TypeSpecifier | None' = None
-		template: list[str] = field(default_factory=lambda: [])
-		body: 'Parser.IndentedBlock' = field(default_factory=lambda: [])
-		type: Types.Type = None
-	Definition = CommandDefinition
-	IndentedBlock = list[Statement | Definition]
-	@dataclass
-	class Module:
-		path: str
-		index: int
-		beg: 'Parser.IndentedBlock'
-		end: 'Parser.IndentedBlock'
-		cmd: 'list[Parser.CommandDefinition]'
-
-	def __post_init__(self):
-		modules: list[Parser.Module] = []
-		ir: list[IR.Code] = []
-		cmdid = 0
-
-		def parse_module(path: Path):
-			tokens = Tokens(path)
-			beg: Parser.IndentedBlock = []
-			end: Parser.IndentedBlock = []
-			cmd: list[Parser.CommandDefinition] = []
-
-			while tokens.value() == 'import':
-				raise NotImplementedError
-			
-			if tokens.value() == 'beg':
-				tokens.expect('beg', Tokens.Newline)
-				beg = parse_indented_block(tokens, 0)
-
-			if tokens.value() == 'end':
-				tokens.expect('end', Tokens.Newline)
-				end = parse_indented_block(tokens, 0)
-
-			while tokens.value():
-				definition = parse_definition(tokens, 0)
-				if type(definition) is Parser.CommandDefinition:
-					cmd.append(definition)
-				else:
-					raise NotImplementedError
-
-			modules.append(Parser.Module(path, len(modules), beg, end, cmd))
-
-		def parse_indented_block(tokens: Tokens, level: int) -> Parser.IndentedBlock:
-			nodes = Parser.IndentedBlock()
-			
-			if tokens.type() is Tokens.Indent:
-				if len(tokens.value()) <= level:
-					tokens.front().error(f'expected indented block of level {level + 1} or higher, found level {level}')
-				level = len(tokens.value())
-
-				while tokens.type() is Tokens.Indent and len(tokens.value()) == level:
-					tokens.expect(Tokens.Indent)
-					try:
-						nodes.append(parse_definition(tokens, level))
-					except Error:
-						nodes.append(parse_statement(tokens, level))
-
-			return nodes
-		
-		def parse_definition(tokens: Tokens, level: int) -> Parser.Definition:
-			return parse_command_definition(tokens, level)
-		
-		def parse_command_definition(tokens: Tokens, level: int) -> Parser.CommandDefinition:
-			nonlocal cmdid
-			command = Parser.CommandDefinition(tokens.expect('cmd').where, tokens.expect(Tokens.Name).value, cmdid)
-
-			while tokens.type() is Tokens.Name:
-				name = tokens.expect(Tokens.Name)
-				if name.value in command.input:
-					name.error('each command parameter must be uniquely named')
-				command.input[name.value] = None
-
-			if len(command.input) or tokens.value() == '[':
-				tokens.expect('[')
-				tokens.expect(']')
-
-			for name in command.input:
-				command.input[name] = parse_type_specifier(tokens)
-
-			if tokens.type() is not Tokens.Newline:
-				tokens.expect('-', '>')
-				command.output = parse_type_specifier(tokens)
-
-			tokens.expect(Tokens.Newline)
-			command.body = parse_indented_block(tokens, level)
-
-			cmdid += 1
-			return command
-
-		def parse_statement(tokens: Tokens, level: int) -> Parser.Statement:
-			return tokens.follow(parse_expression(tokens), Tokens.Newline)
-
-		def parse_expression(tokens: Tokens) -> Parser.Expression:
-			return parse_command_expression(tokens)
-
-		def parse_command_expression(tokens: Tokens) -> Parser.CommandExpression:
-			lhs = parse_primary_expression(tokens)
-
-			while tokens.type() not in [Tokens.Newline, Tokens.Indent, Tokens.Symbol]:
-				if type(lhs) is not Parser.CommandExpression:
-					lhs = Parser.CommandExpression(lhs.where, lhs, [])
-				lhs.rhs.append(parse_primary_expression(tokens))
-
-			return lhs
-
-		def parse_primary_expression(tokens: Tokens) -> Parser.PrimaryExpression:
-			if tokens.type() is Tokens.Name:
-				if tokens.value().startswith('JWLBUILTIN_'):
-					if (tokens.value().startswith('JWLBUILTIN_SYSCALL') and not tokens.value()[18:].isdigit()) or \
-					tokens.value() not in Parser.BuiltinExpression.BUILTINS.__args__:
-						tokens.error(f'no such builtin `{tokens.value()}`')
-					return Parser.BuiltinExpression(tokens.where(), tokens.expect(Tokens.Name).value)
-				else:
-					return Parser.NameExpression(tokens.where(), tokens.expect(Tokens.Name).value)
-			elif tokens.type() is Tokens.Integer:
-				return Parser.IntegerExpression(tokens.where(), tokens.expect(Tokens.Integer).value)
-			elif tokens.type() is Tokens.String:
-				return Parser.StringExpression(tokens.where(), tokens.expect(Tokens.String).value)
-			else:
-				tokens.error('expected expression')
-
-		def parse_type_specifier(tokens: Tokens) -> Parser.TypeSpecifier:
-			spec = Parser.TypeSpecifier(tokens.where(), tokens.expect(Tokens.Name).value)
-			if tokens.value() == '[':
-				tokens.expect('[')
-				while True:
-					spec.template.append(parse_type_specifier(tokens))
-					if tokens.type() != Tokens.Name:
-						break
-				tokens.expect(']')
-			return spec
-		
-		cmds: dict[str, list[Parser.CommandDefinition]] = {}
-		vars: dict[str, Types] = {}
-
-		def typecheck(node: Parser.Module | Parser.Definition | Parser.Statement):
-			nonlocal cmds, vars
-			match type(node):
-				case Parser.Module:
-					[typecheck(command) for command in node.cmd]
-					[typecheck(statement) for statement in node.beg]
-					[typecheck(statement) for statement in node.end]
-					[typecheck(command) for command in node.cmd]
-				case Parser.CommandDefinition:
-					if node.type is None:
-						[typecheck(node.input[name]) for name in node.input]
-						typecheck(node.output) if node.output is not None else ...
-						node.type = Types.cmd([node.input[name].type for name in node.input], node.output.type if node.output else None)
-						if node.name not in cmds:
-							cmds[node.name] = []
-						for cmd in cmds[node.name]:
-							if cmd.input == node.type.input:
-								node.where.error(f'cannot overload command `{node.name}`, as it has the same name and signature as another commmand')
-						cmds[node.name].append(node)
-					else:
-						tcmds = deepcopy(cmds)
-						tvars = deepcopy(vars)
-						vars = {}
-						[vars.update({parameter: node.input[parameter].type}) for parameter in node.input]
-						[typecheck(content) for content in node.body]
-						cmds = tcmds
-						vars = tvars
-				case Parser.CommandExpression:
-					[typecheck(expression) for expression in node.rhs]
-					typecheck(node.lhs)
-					if type(node.lhs.type) is not Types.Command:
-						node.where.error(f'invalid left-hand side type for command expression: expected type `cmd` but found `{node.lhs.type}`')
-					elif len(node.rhs) != len(node.lhs.type.input):
-						node.where.error('parameter-argument count mismatch')
-					for i in range(0, len(node.rhs)):
-						if (node.lhs.type.input[i] != node.rhs[i].type):
-							node.rhs[i].where.error(f'parameter-argument type mismatch: expected type `{node.lhs.type.input[i]}` but found `{node.rhs[i].type}`')
-					node.type = node.lhs.type.output
-				case Parser.NameExpression:
-					if node.value in cmds:
-						if len(cmds[node.value]) > 1:
-							raise NotImplementedError
-						else:
-							node.type = cmds[node.value][0].type
-							node.cmdid = cmds[node.value][0].index
-					elif node.value in vars:
-						node.type = vars[node.value]
-					else:
-						raise NotImplementedError
-				case Parser.IntegerExpression:
-					node.type = Types.builtin['i64']
-				case Parser.StringExpression:
-					node.type = Types.builtin['ptr'](Types.builtin['u8'])
-				case Parser.BuiltinExpression:
-					match node.value:
-						case node.value if node.value.startswith('JWLBUILTIN_SYSCALL'):
-							node.type = Types.cmd([Types.builtin['i64']] + [Types.iop] * int(node.value[18:]), Types.builtin['i64'])
-						case _:
-							raise NotImplementedError(f'typecheck({node.value})')
-				case Parser.TypeSpecifier:
-					[typecheck(argument) for argument in node.template]
-					if node.name in Types.builtin:
-						if node.name == 'ptr':
-							if len(node.template) > 1:
-								node.where.error(f'too many template arguments for pointer type')
-							node.type = Types.builtin['ptr'](node.template[0].type if len(node.template) else None)
-						else:
-							node.type = Types.builtin[node.name]
-					else:
-						raise NotImplementedError(f'typecheck({repr(node)})')
-				case _:
-					raise NotImplementedError(f'typecheck({repr(node)})')
-
-		def genir(node: Parser.Module | Parser.Definition | Parser.Statement):
-			match type(node):
-				case Parser.Module:
-					if len(node.beg):
-						ir.append(IR.FunctionEnter(node.beg[0].where, f'mod{node.index}beg'))
-						[genir(statement) for statement in node.beg]
-						ir.append(IR.FunctionLeave(node.beg[-1].where, f'mod{node.index}beg'))
-
-					if len(node.end):
-						ir.append(IR.FunctionEnter(node.end[0].where, f'mod{node.index}end'))
-						[genir(statement) for statement in node.end]
-						ir.append(IR.FunctionLeave(node.end[-1].where, f'mod{node.index}end'))
-				case Parser.CommandDefinition:
-					ir.append(IR.FunctionEnter(node.where, f'fun{node.index}'))
-					ir.append(IR.CopyArguments(node.where, [(arg, node.input[arg].type) for arg in node.input]))
-					[genir(content) for content in node.body]
-					ir.append(IR.FunctionLeave(node.where, f'fun{node.index}'))
-				case Parser.CommandExpression:
-					[genir(rhs) for rhs in node.rhs]
-					genir(node.lhs)
-					if type(node.lhs) not in [Parser.BuiltinExpression, Parser.NameExpression]:
-						raise NotImplementedError
-				case Parser.NameExpression:
-					if node.cmdid is not None:
-						ir.append(IR.FunctionCall(node.where, f'fun{node.cmdid}', len(node.type.input)))
-					elif node.gblid is not None:
-						raise NotImplementedError(f'genir({node})')
-					else:
-						ir.append(IR.CopyLocal(node.where, node.value))
-				case Parser.IntegerExpression:
-					ir.append(IR.PushInteger(node.where, node.value))
-				case Parser.StringExpression:
-					ir.append(IR.PushString(node.where, node.value))
-				case Parser.BuiltinExpression:
-					match node.value:
-						case node.value if node.value.startswith('JWLBUILTIN_SYSCALL'):
-							ir.append(IR.Syscall(node.where, int(node.value[18:])))
-						case _:
-							raise NotImplementedError(f'genir({node})')
-				case _:
-					raise NotImplementedError(f'genir({node})')
-			return True
-
-		parse_module(self.path)
-		[typecheck(module) for module in modules]
-		
-		ir.append(IR.ProgramEnter(len(modules)))
-		for module in modules:
-			if len(module.beg):
-				ir.append(IR.FunctionCall(module.beg[0].where, f'mod{module.index}beg', 0))
-		for module in reversed(modules):
-			if len(module.end):
-				ir.append(IR.FunctionCall(module.end[0].where, f'mod{module.index}end', 0))
-		ir.append(IR.ProgramLeave())
-		[genir(module) and [genir(cmd) for cmd in module.cmd] for module in modules]
-		
-		self.modules = modules
-		self.ir = ir
-
-@dataclass
-class Compiler:
-	parser: Parser
-	target: Literal['exe', 'asm', 'obj']
-	output: Path
-
-	def __post_init__(self):
-		raise NotImplementedError(self.__class__)
-
-@dataclass
-class Linux_x86_64_NASM(Compiler):
-	def __post_init__(self):
-		@dataclass
-		class Entry:
-			off: int
-			size: int
-			name: str | None = None
-
-			def __str__(self):
-				return f'[rbp - {self.off}]'
-
-		@dataclass
-		class Stack:
-			off: int = 0
-			max: int = 0
-			entries: list[Entry] = None
-
-			def __post_init__(self):
-				self.entries = []
-
-			def push(self, size: int, name: str | None = None) -> Entry:
-				from math import ceil
-				self.off = ceil((self.off + size) / size) * size
-				self.max = max(self.off, self.max)
-				self.entries.append(Entry(self.off, size, name))
-				return self.entries[-1]
-			
-			def pop(self) -> Entry:
-				entry = self.entries.pop()
-				self.off = self.entries[-1].off if len(self.entries) else 0
-				return entry
-			
-			def find(self, name: str) -> Entry | None:
-				matches = [entry for entry in self.entries if entry.name == name]
-				return matches[0] if len(matches) else None
-
-		asm: list[str] = []
-		strs: list[str] = []
-		stack = Stack()
-		inout: int = 0
-
-		for code in self.parser.ir:
-			match type(code):
-				case IR.ProgramEnter:
-					asm = [
-						'default rel',
-						'global _start',
-						'section .text',
-						'_start:'
-					]
-				case IR.ProgramLeave:
-					asm += [
-						'  mov rdi, 0',
-						'  mov rax, 60',
-						'  syscall'
-					]
-				case IR.FunctionCall:
-					off = stack.off
-					size = 0
-					for i in range(0, code.argc):
-						size += stack.pop().size
-					if code.argc > 0:
-						asm += [
-							f'  lea rsi, [rbp - {off}]',
-							f'  lea rdi, [inoutend - {off}]',
-							f'  mov rcx, {size}',
-							f'  rep movsb'
-						]
-					asm.append(f'  call {code.symbol}')
-				case IR.FunctionEnter:
-					stack = Stack()
-					asm += [
-						f'{code.symbol}:',
-						'  push rbp',
-						'  mov rbp, rsp',
-						'#STACKSIZE#'
-					]
-				case IR.FunctionLeave:
-					asm += [
-						'  leave',
-						'  ret'
-					]
-
-					from math import ceil
-					asm[asm.index("#STACKSIZE#")] = f'  sub rsp, {ceil(stack.max / 8) * 8}'
-				case IR.CopyArguments:
-					assert stack.off == 0
-					[stack.push(arg[1].size, arg[0]) for arg in code.args]
-					inout = max(inout, stack.off)
-					asm += [
-						f'  lea rsi, [inoutend - {stack.off}]', # src
-						f'  lea rdi, [rbp - {stack.off}]',
-						f'  mov rcx, {stack.off}',
-						f'  rep movsb'
-					]
-				case IR.CopyLocal:
-					src = stack.find(code.name)
-					assert src
-					dst = stack.push(src.size)
-					asm += [
-						f'  lea rsi, {src}',
-						f'  lea rdi, {dst}',
-						f'  mov rcx, {src.size}',
-						f'  rep movsb'
-					]
-				case IR.PushInteger:
-					asm += [
-						f'  mov rax, {code.value}',
-						f'  mov {stack.push(8)}, rax'
-					]
-				case IR.PushString:
-					if code.value not in strs:
-						strs.append(code.value)
-					asm += [
-						f'  lea rax, str{strs.index(code.value)}',
-						f'  mov {stack.push(8)}, rax'
-					]
-				case IR.Syscall:
-					for i in range(code.argc - 1, -1, -1):
-						if i > 5:
-							code.where.error('Linux x86_64 only supports syscalls with up to 6 arguments')
-						reg = ('rdi', 'rsi', 'rdx', 'r10', 'r8', 'r9')[i]
-						asm.append(f'  mov {reg}, {stack.pop()}')
-					asm += [
-						f'  mov rax, {stack.pop()}',
-						f'  syscall',
-						f'  mov {stack.push(8)}, rax'
-					]
-				case _:
-					print(stack)
-					raise NotImplementedError(f'compile({code})')
-				
-		if len(strs):
-			asm.append('section .data')
-			for i in range(0, len(strs)):
-				asm += [
-					f'str{i}:',
-					f'  db {', '.join(str(b) for b in list(strs[i]) + [0])}'
-				]
-
-		if inout > 0:
-			asm += [
-				'section .bss',
-				'inout:',
-				f'  resb {inout}',
-				'inoutend:',
-				f'  resb 0'
-			]
-		
-		if self.target == 'asm': open(self.output, 'w').write('\n'.join(asm))
-		else:
-			temp = NamedTemporaryFile('w', delete_on_close=False)
-			temp.write('\n'.join(asm))
-			temp.close()
-			
-			if self.target == 'obj':
-				run(['nasm', '-f', 'elf64', '-o', self.output, temp.name])
-			else:
-				temp2 = NamedTemporaryFile('w', delete_on_close=False)
-				temp2.close()
-				run(['nasm', '-f', 'elf64', '-o', temp2.name, temp.name])
-				run(['ld', '-o', self.output, temp2.name])
-
-if __name__ == '__main__':
-	import platform
-	from sys import argv, exit
-
-	try:
-		asm = '-s' in argv
-		obj = '-o' in argv
-
-		while '-s' in argv: argv.remove('-s')
-		while '-o' in argv: argv.remove('-o')
-
-		if asm and obj:
-			raise Error('error: only one of [-s | -o] may be provided')
-
-		if len(argv) != 3:
-			raise Error(
-				f'usage: {argv[0]} [-s | -o] <input> <output>\n'
-				'\n'
-				'options:\n'
-				'  -s      write assembly to <output>\n'
-				'  -o      write assembler\'s output to <output>'
-			)
-		
-		target = f'{platform.system()}-{platform.machine()}'
-		targets: dict[str, type[Compiler]] = {
-			'Linux-x86_64': Linux_x86_64_NASM
-		}
-
-		if target not in targets:
-			raise Error(f'error: unsupported platform `{platform.system()} {platform.machine()}`')
-		
-		compiler = targets[target](Parser(argv[1]), 'exe' if not asm and not obj else 'obj' if obj else 'asm', argv[2])
-	except Error as e:
-		print(e.msg)
+#!/usr/bin/env node
+
+// jwlc, a bootstrap compiler for the jwl programming language
+// Copyright (C) 2025 Jonathan Walton
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import * as os from 'os'
+import { readFileSync } from 'fs'
+import { argv, exit } from 'process'
+import { styleText as style } from 'util'
+
+const len = (a) => a.length
+const last = (a) => a[a.length - 1]
+const print = (...a) => console.log(...a)
+const display = (a) => console.dir(a, {depth: null})
+
+const readlines = (path) => {
+	try {
+		return readFileSync(path).toString().replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n')
+	} catch(err) {
+		print(style(['bold', 'redBright'], `error: `) + `${path}: ${/^Error: \S+:/.test(err.toString()) ? err.toString().replaceAll(/^Error: \S+: /g, '').replaceAll(/, [^,]+$/g, '') : err}`)
 		exit(1)
+	}
+}
+
+const where = (path, row, col) => { return { path: path, row: row, col: col, error: function (msg, ...extra) {
+	print(style(['bold', 'whiteBright'], `${this.path}:${this.row}:${this.col}: `) + style(['bold', 'redBright'], 'error: ') + msg)
+	for (const e of extra) print(e)
+	exit(1)
+}}}
+
+class TokenKind {
+	static EOF = new TokenKind('end of file')
+	static Newline = new TokenKind('newline')
+	static Indent = new TokenKind('indent')
+	static Keyword = new TokenKind('keyword')
+	static Word = new TokenKind('word')
+	static Integer = new TokenKind('integer')
+	static Symbol = new TokenKind('symbol')
+	constructor (name) { this.name = name }
+}
+
+const tokenize = (path) => {
+	let tokens = []
+	tokens.lines = readlines(path)
+	tokens.index = 0
+	tokens.now = function() {	return this[this.index]	}
+	tokens.lineCaret = function() {
+		return [
+			`  ${String(this.now().where.row).padStart(Math.ceil(len(this.lines) / 10))} | ${this.lines[this.now().where.row - 1]}`,
+			`  ${' '.repeat(Math.ceil(len(this.lines) / 10))} | ${'^'.padStart(this.now().where.col)}`,
+		]
+	}
+	tokens.expect = function(...expected) {
+		let r = []
+		for (const e of expected) {
+			if (typeof(e) !== 'string' && !(e instanceof TokenKind))
+				throw Error(`${e} must be a string or a TokenKind (typeof(e) is ${typeof(e)} and (e isntanceof TokenKind) is ${e instanceof TokenKind})`)
+
+			if (typeof(e) === 'string' && this.now().value != e)
+				this.now().where.error(`expected '${e}' but found ${this.now().kind.name} '${this.now().value}'`, ...this.lineCaret())
+			else if (e instanceof TokenKind && this.now().kind != e)
+				this.now().where.error(`expected ${e.name} but found ${this.now().kind.name} '${this.now().value}'`, ...this.lineCaret())
+			r.push(tokens.now())
+			this.index += 1
+		}
+		return len(r) == 1 ? r[0] : r
+	}
+	tokens.expectone = function (...options) {
+		for (const o of options) {
+			if (typeof(o) !== 'string' && !(e instanceof TokenKind))
+				throw Error(`${o} must be a string or a TokenKind (typeof(e) is ${typeof(o)} and (e isntanceof TokenKind) is ${o instanceof TokenKind})`)
+
+			if (this.now().value == o || this.now().kind == o)
+				return this.expect(o)
+		}
+		this.now().where.error(`expected one of ${options} but found ${this.now().kind.name} '${this.now().value}'`)
+	}
+	tokens.advance = function () {
+		return this[this.index++]
+	}
+
+	const content = tokens.lines.join('\n')
+	let row = 1, colstart = 0, colend = 0
+	for (let i = 0; i < len(content);) {
+		let length = 0
+		let now = where(path, row, i - colstart + 1)
+
+		if (content[i] == '\n') {
+			length = 1
+			if (len(tokens) && last(tokens).kind == TokenKind.Indent)
+				tokens.pop()
+			else if (len(tokens) && last(tokens).kind != TokenKind.Newline)
+				tokens.push({kind: TokenKind.Newline, value: '\n', where: now})
+			row++
+			colstart = i + 1
+		} else if (/\s/.test(content[i])) {
+			do length++; while(/\s/.test(content[i + length]))
+			if (len(tokens) && last(tokens).kind == TokenKind.Newline)
+				tokens.push({kind: TokenKind.Newline, value: ' '.repeat(length), where: now})
+		} else if (/[A-Za-z]/.test(content[i])) {
+			do length++; while (/[A-Za-z0-9_]/.test(content[i + length]))
+			tokens.push({kind: TokenKind.Word, value: content.substring(i, i + length), where: now})
+
+			if (['let'].includes(last(tokens).value))
+				last(tokens).kind = TokenKind.Keyword
+		} else if (/[0-9]/.test(content[i])) {
+			do length++; while (/[0-9]/.test(content[i + length]))
+			tokens.push({kind: TokenKind.Integer, value: content.substring(i, i + length), where: now})
+		} else if (['=', '+', '-', '*', '/', ':'].includes(content[i])) {
+			length = 1
+			tokens.push({kind: TokenKind.Symbol, value: content[i], where: now})
+		} else {
+			now.error(`failed to tokenize character '${content[i]}'`)
+		}
+		i += length
+		colend = i - colstart + 1
+	}
+
+	if (!last(tokens) || last(tokens).kind != TokenKind.Newline)
+		tokens.push({kind: TokenKind.Newline, value: '\n', where: where(path, row, colend) })
+
+	tokens.push({kind: TokenKind.EOF, value: undefined, where: where(path, row, colend + 1)})
+	
+	return tokens
+}
+
+const parse = (path) => {
+	let nodes = []
+	let modules = []
+
+	function module(path) {
+		if (modules.includes(path)) return;
+		modules.push(path);
+
+		let tokens = tokenize(path)
+		nodes.push({
+			path: path,
+			content: block(tokens, 0)
+		})
+		tokens.expect(TokenKind.EOF)
+	}
+
+	function block(tokens, indent) {
+		let self = {statements: []}
+
+		if (indent)
+			throw Error('unimplemented')
+
+		do {
+			let stat = statement(tokens, indent + 1)
+			if (stat.kind == 'declaration' && len(self.statements.filter((e) => e.name == stat.name)))
+				stat.where.error(`redefinition of name '${stat.name}'`)
+			self.statements.push(stat)
+		} while (!indent && tokens.now().kind != TokenKind.EOF)
+
+		return self
+	}
+
+	function statement(tokens, indent) {
+		let self = {where: tokens.now().where}
+		if (tokens.now().value == 'let') {
+			self.kind = 'declaration',
+			self.name = tokens.expect('let', TokenKind.Word)[1].value
+			self.mutable = tokens.expectone(':', '=').value == ':'
+			tokens.expect('=')
+			self.expression = expression(tokens)
+		} else
+			tokens.now().where.error('expected statement');
+		tokens.expect(TokenKind.Newline)
+		return self
+	}
+
+	function expression(tokens) {
+		return additive(tokens)
+	}
+
+	function additive(tokens) {
+		let lhs = multiplicative(tokens)
+		while (['+', '-'].includes(tokens.now().value))
+			lhs = {where: lhs.where, kind: tokens.advance().value == '+' ? 'add' : 'sub', lhs: lhs, rhs: multiplicative(tokens)}
+		return lhs
+	}
+	
+	function multiplicative(tokens) {
+		let lhs = primary(tokens)
+		while (['*', '/'].includes(tokens.now().value))
+			lhs = {where: lhs.where, kind: tokens.advance().value == '*' ? 'mul' : 'div', lhs: lhs, rhs: primary(tokens)}
+		return lhs
+	}
+
+	function primary(tokens) {
+		if (tokens.now().kind == TokenKind.Integer)
+			return {where: tokens.now().where, kind: 'integer', value: tokens.expect(TokenKind.Integer).value}
+		else
+			tokens.now().where.error('expected expression', ...tokens.lineCaret())
+	}
+
+	module(path)
+	return nodes
+}
+
+const compile_linux_x86_64 = (path) => {
+	let nodes = parse(path)
+}
+
+const main = () => {
+	const input = argv[2]
+	const output = argv[3]
+	
+	if (!input || !output) {
+		print(`usage: ${argv[1]} <input-path> <output-path>`)
+		exit(1)
+	}
+
+	switch (`${os.platform()}-${os.machine()}`.toLowerCase()) {
+		case 'linux-x86_64':
+			compile_linux_x86_64(input)
+			break
+		default:
+			print(style(['bold', 'redBright'], 'error: ') + `${os.platform()} ${os.machine()}: unsupported target system`)
+			exit(1)
+	}
+}
+
+main()
