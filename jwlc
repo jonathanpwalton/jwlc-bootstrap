@@ -21,11 +21,18 @@ import { readFileSync } from 'fs'
 import { argv, exit } from 'process'
 import { styleText as style } from 'util'
 
+const replaceObject = (a, b) => {
+	let tmp = {}
+	Object.assign(tmp, b)
+	for (let p in a) delete a[p]
+	Object.assign(a, tmp)
+}
+
 const len = (a) => a.length
 const last = (a) => a[a.length - 1]
 const print = (...a) => console.log(...a)
 const display = (a) => console.dir(a, {depth: null})
-
+const ASSERT = (condition) => { if (!condition) throw Error('assertion failure') }
 const readlines = (path) => {
 	try {
 		return readFileSync(path).toString().replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n')
@@ -57,10 +64,11 @@ const tokenize = (path) => {
 	tokens.lines = readlines(path)
 	tokens.index = 0
 	tokens.now = function() {	return this[this.index]	}
-	tokens.lineCaret = function() {
+	tokens.lineCaret = function(token) {
+		if (!token) token = this.now()
 		return [
-			`  ${String(this.now().where.row).padStart(Math.ceil(len(this.lines) / 10))} | ${this.lines[this.now().where.row - 1]}`,
-			`  ${' '.repeat(Math.ceil(len(this.lines) / 10))} | ${'^'.padStart(this.now().where.col)}`,
+			`  ${String(token.where.row).padStart(Math.ceil(len(this.lines) / 10))} | ${this.lines[token.where.row - 1]}`,
+			`  ${' '.repeat(Math.ceil(len(this.lines) / 10))} | ${'^'.padStart(token.where.col)}`,
 		]
 	}
 	tokens.expect = function(...expected) {
@@ -119,7 +127,7 @@ const tokenize = (path) => {
 		} else if (/[0-9]/.test(content[i])) {
 			do length++; while (/[0-9]/.test(content[i + length]))
 			tokens.push({kind: TokenKind.Integer, value: content.substring(i, i + length), where: now})
-		} else if (['=', '+', '-', '*', '/', ':'].includes(content[i])) {
+		} else if (['=', '+', '-', '*', '/', ':', '(', ')'].includes(content[i])) {
 			length = 1
 			tokens.push({kind: TokenKind.Symbol, value: content[i], where: now})
 		} else {
@@ -137,7 +145,52 @@ const tokenize = (path) => {
 	return tokens
 }
 
+class Type {
+	static u8  = new Type('u8',  1, 1, {integral: true})
+	static u16 = new Type('u16', 2, 2, {integral: true})
+	static u32 = new Type('u32', 4, 4, {integral: true})
+	static u64 = new Type('u64', 8, 8, {integral: true})
+	static i8  = new Type('i8',  1, 1, {integral: true, signed: true})
+	static i16 = new Type('i16', 2, 2, {integral: true, signed: true})
+	static i32 = new Type('i32', 4, 4, {integral: true, signed: true})
+	static i64 = new Type('i64', 8, 8, {integral: true, signed: true})
+	static ptr = (value) => new Type('ptr', 8, 8, {value: value})
+	static fun = (input, output) => new Type('fun', 8, 8, input && output ? {input: input, output: output} : input ? {input: input} : output ? {output: output} : {})
+
+	constructor(name, size, alignment, obj) {
+		this.name = name
+		this.size = size
+		this.alignment = alignment
+
+		if (obj !== undefined) {
+			Object.assign(this, obj)
+		}
+	}
+
+	is(other) {
+		if (this.name == 'fun' && other.name == 'fun')
+			return JSON.stringify(this.input) === JSON.stringify(other.input)
+		return JSON.stringify(this) === JSON.stringify(other)
+	}
+
+	toString() {
+		return this.name
+	}
+}
+
 const parse = (path) => {
+	const INITIALIZERS = {}
+	const FUNCTIONS = {add: [], sub: [], mul: [], div: []}
+	new Array(Type.u8, Type.u16, Type.u32, Type.u64, Type.i8, Type.i16, Type.i32, Type.i64)
+		.forEach(t => {
+			INITIALIZERS[t.name] = [{builtin: true, name: t.name, type: t}]
+			FUNCTIONS.add.push({builtin: true, name: 'add', type: Type.fun([t, t], t)})
+			FUNCTIONS.sub.push({builtin: true, name: 'sub', type: Type.fun([t, t], t)})
+			FUNCTIONS.mul.push({builtin: true, name: 'mul', type: Type.fun([t, t], t)})
+			FUNCTIONS.div.push({builtin: true, name: 'div', type: Type.fun([t, t], t)})
+		}
+	)
+
 	let nodes = []
 	let modules = []
 
@@ -147,6 +200,7 @@ const parse = (path) => {
 
 		let tokens = tokenize(path)
 		nodes.push({
+			kind: 'module',
 			path: path,
 			content: block(tokens, 0)
 		})
@@ -190,25 +244,125 @@ const parse = (path) => {
 	function additive(tokens) {
 		let lhs = multiplicative(tokens)
 		while (['+', '-'].includes(tokens.now().value))
-			lhs = {where: lhs.where, kind: tokens.advance().value == '+' ? 'add' : 'sub', lhs: lhs, rhs: multiplicative(tokens)}
+			lhs = {
+				where: lhs.where,
+				kind: 'call',
+				lhs: {where: lhs.where, kind: 'word', value: tokens.advance().value == '+' ? 'add' : 'sub'},
+				rhs: [lhs, multiplicative(tokens)]
+			}
 		return lhs
 	}
 	
 	function multiplicative(tokens) {
-		let lhs = primary(tokens)
+		let lhs = postfix(tokens)
 		while (['*', '/'].includes(tokens.now().value))
-			lhs = {where: lhs.where, kind: tokens.advance().value == '*' ? 'mul' : 'div', lhs: lhs, rhs: primary(tokens)}
+			lhs = {
+				where: lhs.where,
+				kind: 'call',
+				lhs: {where: lhs.where, kind: 'word', value: tokens.advance().value == '*' ? 'mul' : 'div'},
+				rhs: [lhs, postfix(tokens)]
+			}
+		return lhs
+	}
+
+	function postfix(tokens) {
+		let lhs = primary(tokens)
+		while (['('].includes(tokens.now().value)) {
+			switch (tokens.now().value) {
+				case '(': {
+					let rhs = []
+					tokens.expect('(')
+					while (true) {
+						rhs.push(expression(tokens))
+						if (tokens.now().value == ')')
+							break
+						tokens.expect(',')
+					}
+					tokens.expect(')')
+					lhs = {where: lhs.where, kind: 'call', lhs: lhs, rhs: rhs}
+				} break
+				default:
+					throw Error('unreachable')
+			}
+		}
 		return lhs
 	}
 
 	function primary(tokens) {
 		if (tokens.now().kind == TokenKind.Integer)
 			return {where: tokens.now().where, kind: 'integer', value: tokens.expect(TokenKind.Integer).value}
+		else if (tokens.now().kind == TokenKind.Word)
+			return {where: tokens.now().where, kind: 'word', value: tokens.expect(TokenKind.Word).value}
 		else
 			tokens.now().where.error('expected expression', ...tokens.lineCaret())
 	}
 
+	function typecheck(node, expectedType) {
+		if (expectedType && !(expectedType instanceof Type))
+			throw Error(`unreachable, expectedType is ${JSON.stringify(expectedType)}`)
+
+		switch (node.kind) {
+			case 'module':
+				for (let s of node.content.statements) typecheck(s)
+				break
+			case 'declaration':
+				if (!typecheck(node.expression) || !node.expression.type)
+					node.where.error(`failed to determine type of '${node.name}'`)
+				node.type = node.expression.type
+				break
+			case 'call':
+				if (node.lhs.kind == 'word') {
+					if (node.lhs.value in INITIALIZERS) {
+						let initializers = INITIALIZERS[node.lhs.value]
+
+						for (let initializer of initializers) {
+							if (initializer.builtin) {
+								if (len(node.rhs) != 1)
+									continue
+								if (!typecheck(node.rhs[0], initializer.type))
+									continue
+								node.type = initializer.type
+								node.init = initializer
+								break
+							} else {
+								throw Error('unimplemented')
+							}
+						}
+					} else if (node.lhs.value in FUNCTIONS) {
+						const fns = expectedType ? FUNCTIONS[node.lhs.value].filter(f => f.type.output.is(expectedType)) : FUNCTIONS[node.lhs.value]
+
+						outer: for (const fn of fns) {
+							if (len(fn.type.input) != len(node.rhs))
+								continue outer
+
+							for (let i = 0; i < len(node.rhs); i++) {
+								if (!typecheck(node.rhs[i], fn.type.input[i]))
+									continue outer
+							}
+							
+							node.type = fn.type.output
+							node.function = fn
+							break outer
+						}
+					} else {
+						node.lhs.where.error(`undefined reference to '${node.lhs.value}'`)
+					}
+				} else {
+					throw Error('unimplemented')
+				}
+				break
+			case 'integer':
+				node.type = expectedType && expectedType.integral ? expectedType : undefined
+				break
+			default:
+				throw Error(`unimplemented: typecheck(${node.kind})\n${JSON.stringify(node, null, 2)}`)
+		}
+		return expectedType ? node.type.is(expectedType) : true
+	}
+
 	module(path)
+	nodes.forEach(typecheck)
+	display(nodes)
 	return nodes
 }
 
